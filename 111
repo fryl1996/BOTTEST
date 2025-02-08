@@ -1,0 +1,536 @@
+import os
+import random
+import logging
+import aiohttp
+import aiosqlite
+import asyncio
+import json
+from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from cryptography.fernet import Fernet
+from datetime import datetime, timedelta
+
+# Константы для сумм чеков
+CHECK_AMOUNTS = {
+    "free": (0.01, 0.10),
+    "5": (2.5, 6.5),
+    "25": (6.5, 30),
+    "50": (20, 60),
+    "100": (50, 110),
+    "250": (130, 270),
+}
+
+# Настройка логирования
+logging.basicConfig(
+    filename='bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Загружаем переменные из .env
+load_dotenv()
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CRYPTO_BOT_API = os.getenv("CRYPTO_BOT_API", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+# Проверка наличия всех необходимых переменных окружения
+if not all([API_ID, API_HASH, BOT_TOKEN, CRYPTO_BOT_API, ADMIN_ID]):
+    raise ValueError("❌ Не все переменные окружения заданы в .env файле!")
+
+# Настройка шифрования
+KEY_FILE = "fernet_key.key"
+if os.path.exists(KEY_FILE):
+    with open(KEY_FILE, "rb") as key_file:
+        key = key_file.read()
+else:
+    key = Fernet.generate_key()
+    with open(KEY_FILE, "wb") as key_file:
+        key_file.write(key)
+
+cipher_suite = Fernet(key)
+encrypted_token = cipher_suite.encrypt(BOT_TOKEN.encode())
+
+# Инициализация бота
+bot = Client("crypto_payment_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+async def send_admin_notification(message):
+    """Отправка уведомления администратору."""
+    try:
+        await bot.send_message(ADMIN_ID, f"⚠️ Уведомление: {message}")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке уведомления админу: {e}")
+
+async def init_db():
+    """Инициализация базы данных."""
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute('''CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                language TEXT DEFAULT 'ru',
+                first_purchase_done INTEGER DEFAULT 0,
+                wallet_balance REAL DEFAULT 0,
+                is_premium INTEGER DEFAULT 0,
+                registration_date DATETIME DEFAULT CURRENT_TIMESTAMP
+            )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS purchases (
+                purchase_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                status TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                payment_method TEXT
+            )''')
+            
+            await db.execute('''CREATE TABLE IF NOT EXISTS referrals (
+                user_id INTEGER PRIMARY KEY,
+                referred_by INTEGER,
+                bonus REAL DEFAULT 0,
+                referred_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )''')
+            
+            await db.commit()
+            logging.info("База данных успешно инициализирована")
+    except Exception as e:
+        logging.error(f"Ошибка при инициализации базы данных: {e}")
+        await send_admin_notification(f"Ошибка при инициализации базы данных: {e}")
+
+async def cleanup_old_purchases():
+    """Очистка старых платежей (старше 30 дней)."""
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+            await db.execute('DELETE FROM purchases WHERE timestamp < ?', (thirty_days_ago,))
+            await db.commit()
+            logging.info("Очистка старых платежей выполнена успешно")
+    except Exception as e:
+        logging.error(f"Ошибка при очистке старых платежей: {e}")
+        await send_admin_notification(f"Ошибка при очистке старых платежей: {e}")
+
+async def get_user_language(user_id):
+    """Получение языка пользователя."""
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute('SELECT language FROM users WHERE user_id = ?', (user_id,)) as cursor:
+                result = await cursor.fetchone()
+                return result[0] if result else "ru"
+    except Exception as e:
+        logging.error(f"Ошибка при получении языка пользователя: {e}")
+        return "ru"
+
+@bot.on_message(filters.command("start"))
+async def start(client, message):
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name
+    referred_by = None
+
+    if len(message.command) > 1:
+        try:
+            referred_by = int(message.command[1])
+        except ValueError:
+            logging.warning(f"Некорректный реферальный код: {message.command[1]}")
+            referred_by = None
+
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            # Регистрация пользователя
+            await db.execute('''
+                INSERT OR IGNORE INTO users 
+                (user_id, username, language, first_purchase_done) 
+                VALUES (?, ?, 'ru', 0)
+            ''', (user_id, user_name))
+            
+            # Обработка реферальной системы
+            if referred_by and referred_by != user_id:
+                await db.execute('''
+                    INSERT OR IGNORE INTO referrals 
+                    (user_id, referred_by) 
+                    VALUES (?, ?)
+                ''', (user_id, referred_by))
+            
+            await db.commit()
+
+        language = await get_user_language(user_id)
+        text = "Привет, {}! 🎉 Выберите действие:".format(user_name) if language == "ru" else "Hello, {}! 🎉 Choose an action:".format(user_name)
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Купить чек за 100₽" if language == "ru" else "💳 Buy a check for $1.5", callback_data="buy_check")],
+            [InlineKeyboardButton("📞 Поддержка" if language == "ru" else "📞 Support", url="https://t.me/your_support")],
+            [InlineKeyboardButton("📜 История покупок" if language == "ru" else "📜 Purchase History", callback_data="history")],
+            [InlineKeyboardButton("👥 Реферальная система" if language == "ru" else "👥 Referral System", callback_data="ref")],
+            [InlineKeyboardButton("💰 Баланс" if language == "ru" else "💰 Balance", callback_data="balance")]
+        ])
+        
+        await message.reply_text(text, reply_markup=keyboard)
+        logging.info(f"Новый пользователь: {user_id}")
+    except Exception as e:
+        logging.error(f"Ошибка при обработке команды start: {e}")
+        await message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+
+@bot.on_callback_query(filters.regex("buy_check"))
+async def buy_check(client, callback_query):
+    user_id = callback_query.from_user.id
+    language = await get_user_language(user_id)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("1️⃣ Бесплатный чек (1-10 центов)", callback_data="check_free")],
+        [InlineKeyboardButton("2️⃣ Баланс 5$ (рандом 2.5-6.5$)", callback_data="check_5")],
+        [InlineKeyboardButton("2.1 Баланс 25$ (рандом 6.5-30$)", callback_data="check_25")],
+        [InlineKeyboardButton("2.2 Баланс 50$ (рандом 20-60$)", callback_data="check_50")],
+        [InlineKeyboardButton("2.3 Баланс 100$ (рандом 50-110$)", callback_data="check_100")],
+        [InlineKeyboardButton("2.4 Баланс 250$ (рандом 130-270$)", callback_data="check_250")],
+        [InlineKeyboardButton("🔙 Назад" if language == "ru" else "🔙 Back", callback_data="back_to_main")]
+    ])
+
+    await callback_query.message.edit_text(
+        "Выберите вариант покупки чека:" if language == "ru" else "Choose a check purchase option:",
+        reply_markup=keyboard
+    )
+
+async def create_crypto_payment(amount, description):
+    """Создание платежа через CryptoBot API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://pay.crypt.bot/api/createInvoice"
+            headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_API}
+            data = {
+                "asset": "USDT",
+                "amount": amount,
+                "description": description
+            }
+
+            async with session.post(url, json=data, headers=headers) as response:
+                if response.status != 200:
+                    raise Exception(f"API вернул статус {response.status}")
+                
+                result = await response.json()
+                if "result" not in result:
+                    raise Exception("Неверный формат ответа от API")
+                
+                return result["result"]
+    except Exception as e:
+        logging.error(f"Ошибка при создании платежа: {e}")
+        raise
+
+async def check_crypto_payment(invoice_id):
+    """Проверка статуса платежа через CryptoBot API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://pay.crypt.bot/api/getInvoices"
+            headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_API}
+            params = {"invoice_ids": invoice_id}
+
+            async with session.get(url, headers=headers, params=params) as response:
+                if response.status != 200:
+                    raise Exception(f"API вернул статус {response.status}")
+                
+                result = await response.json()
+                if "result" not in result or "items" not in result["result"]:
+                    raise Exception("Неверный формат ответа от API")
+                
+                return result["result"]["items"][0] if result["result"]["items"] else None
+    except Exception as e:
+        logging.error(f"Ошибка при проверке платежа: {e}")
+        raise
+
+@bot.on_callback_query(filters.regex(r"^check_(free|5|25|50|100|250)$"))
+async def purchase_check(client, callback_query):
+    user_id = callback_query.from_user.id
+    language = await get_user_language(user_id)
+    check_type = callback_query.data.split("_")[1]
+
+    try:
+        min_value, max_value = CHECK_AMOUNTS[check_type]
+        random_amount = round(random.uniform(min_value, max_value), 2)
+
+        # Проверяем баланс пользователя
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute('SELECT wallet_balance FROM users WHERE user_id = ?', (user_id,)) as cursor:
+                balance = await cursor.fetchone()
+
+        if not balance or balance[0] < min_value:
+            text = "❌ Недостаточно средств на балансе." if language == "ru" else "❌ Insufficient funds on balance."
+        else:
+            # Создаем платеж
+            payment_result = await create_crypto_payment(
+                amount=min_value,
+                description=f"Check purchase ({check_type})"
+            )
+
+            # Обновляем баланс пользователя
+            async with aiosqlite.connect("bot.db") as db:
+                await db.execute('''
+                    UPDATE users 
+                    SET wallet_balance = wallet_balance - ? 
+                    WHERE user_id = ?
+                ''', (min_value, user_id))
+                
+                await db.execute('''
+                    INSERT INTO purchases 
+                    (user_id, amount, status, payment_method) 
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, random_amount, 'completed', 'crypto'))
+                
+                await db.commit()
+
+            text = (
+                f"✅ Вы приобрели чек на сумму {random_amount} USDT!"
+                if language == "ru" else
+                f"✅ You have purchased a check for {random_amount} USDT!"
+            )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Назад" if language == "ru" else "🔙 Back",
+                callback_data="buy_check"
+            )]
+        ])
+
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Ошибка при покупке чека: {e}")
+        error_text = (
+            "❌ Произошла ошибка при обработке платежа. Попробуйте позже."
+            if language == "ru" else
+            "❌ An error occurred while processing the payment. Please try again later."
+        )
+        await callback_query.message.edit_text(error_text)
+
+@bot.on_callback_query(filters.regex("balance"))
+async def check_balance(client, callback_query):
+    user_id = callback_query.from_user.id
+    language = await get_user_language(user_id)
+
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute('SELECT wallet_balance FROM users WHERE user_id = ?', (user_id,)) as cursor:
+                balance = await cursor.fetchone()
+
+        text = (
+            f"💰 Ваш баланс: {balance[0]} USDT" if balance else "❌ Баланс не найден"
+            if language == "ru" else
+            f"💰 Your balance: {balance[0]} USDT" if balance else "❌ Balance not found"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "💳 Пополнить баланс" if language == "ru" else "💳 Top up balance",
+                callback_data="top_up_balance"
+                        )],
+            [InlineKeyboardButton(
+                "📜 История покупок" if language == "ru" else "📜 Purchase History",
+                callback_data="history"
+            )],
+            [InlineKeyboardButton(
+                "🔙 Назад" if language == "ru" else "🔙 Back",
+                callback_data="back_to_main"
+            )]
+        ])
+
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Ошибка при проверке баланса: {e}")
+        await callback_query.message.edit_text(
+            "❌ Ошибка при обработке запроса. Попробуйте позже."
+            if language == "ru" else
+            "❌ Error processing request. Please try again later."
+        )
+
+@bot.on_callback_query(filters.regex("history"))
+async def history(client, callback_query):
+    user_id = callback_query.from_user.id
+    language = await get_user_language(user_id)
+
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute(
+                'SELECT amount, status, timestamp FROM purchases WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10',
+                (user_id,)
+            ) as cursor:
+                purchases = await cursor.fetchall()
+
+        if purchases:
+            text = "📜 Ваши последние покупки:\n\n" if language == "ru" else "📜 Your recent purchases:\n\n"
+            for amount, status, timestamp in purchases:
+                dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                date_str = dt.strftime('%Y-%m-%d %H:%M')
+                text += f"💳 {amount} USDT - {status} ({date_str})\n"
+        else:
+            text = "📜 У вас пока нет покупок." if language == "ru" else "📜 You have no purchases yet."
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Назад" if language == "ru" else "🔙 Back",
+                callback_data="back_to_main"
+            )]
+        ])
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Ошибка при получении истории покупок: {e}")
+        await callback_query.message.edit_text(
+            "❌ Ошибка при обработке запроса. Попробуйте позже."
+            if language == "ru" else
+            "❌ Error processing request. Please try again later."
+        )
+
+@bot.on_callback_query(filters.regex("ref"))
+async def ref(client, callback_query):
+    user_id = callback_query.from_user.id
+    language = await get_user_language(user_id)
+
+    try:
+        ref_link = f"https://t.me/{(await bot.get_me()).username}?start={user_id}"
+        
+        async with aiosqlite.connect("bot.db") as db:
+            # Получаем количество рефералов
+            async with db.execute(
+                'SELECT COUNT(*) FROM referrals WHERE referred_by = ?',
+                (user_id,)
+            ) as cursor:
+                referral_count = (await cursor.fetchone())[0]
+            
+            # Получаем сумму бонусов
+            async with db.execute(
+                'SELECT SUM(bonus) FROM referrals WHERE referred_by = ?',
+                (user_id,)
+            ) as cursor:
+                total_bonus = (await cursor.fetchone())[0] or 0
+
+        if language == "ru":
+            text = (
+                f"👥 Реферальная система\n\n"
+                f"Ваша реферальная ссылка:\n{ref_link}\n\n"
+                f"Количество рефералов: {referral_count}\n"
+                f"Полученные бонусы: {total_bonus} USDT"
+            )
+        else:
+            text = (
+                f"👥 Referral System\n\n"
+                f"Your referral link:\n{ref_link}\n\n"
+                f"Number of referrals: {referral_count}\n"
+                f"Total bonuses: {total_bonus} USDT"
+            )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔙 Назад" if language == "ru" else "🔙 Back",
+                callback_data="back_to_main"
+            )]
+        ])
+        
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Ошибка при обработке реферальной системы: {e}")
+        await callback_query.message.edit_text(
+            "❌ Ошибка при обработке запроса. Попробуйте позже."
+            if language == "ru" else
+            "❌ Error processing request. Please try again later."
+        )
+
+@bot.on_callback_query(filters.regex("back_to_main"))
+async def back_to_main(client, callback_query):
+    user_id = callback_query.from_user.id
+    user_name = callback_query.from_user.first_name
+    language = await get_user_language(user_id)
+
+    text = (
+        "Привет, {}! 🎉 Выберите действие:"
+        if language == "ru" else
+        "Hello, {}! 🎉 Choose an action:"
+    ).format(user_name)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "💳 Купить чек за 100₽" if language == "ru" else "💳 Buy a check for $1.5",
+            callback_data="buy_check"
+        )],
+        [InlineKeyboardButton(
+            "📞 Поддержка" if language == "ru" else "📞 Support",
+            url="https://t.me/your_support"
+        )],
+        [InlineKeyboardButton(
+            "📜 История покупок" if language == "ru" else "📜 Purchase History",
+            callback_data="history"
+        )],
+        [InlineKeyboardButton(
+            "👥 Реферальная система" if language == "ru" else "👥 Referral System",
+            callback_data="ref"
+        )],
+        [InlineKeyboardButton(
+            "💰 Баланс" if language == "ru" else "💰 Balance",
+            callback_data="balance"
+        )]
+    ])
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard)
+
+@bot.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def stats(client, message):
+    try:
+        async with aiosqlite.connect("bot.db") as db:
+            # Общее количество пользователей
+            async with db.execute('SELECT COUNT(*) FROM users') as cursor:
+                total_users = (await cursor.fetchone())[0]
+            
+            # Количество успешных покупок
+            async with db.execute('SELECT COUNT(*) FROM purchases WHERE status = "completed"') as cursor:
+                total_purchases = (await cursor.fetchone())[0]
+            
+            # Общая сумма покупок
+            async with db.execute('SELECT SUM(amount) FROM purchases WHERE status = "completed"') as cursor:
+                total_revenue = (await cursor.fetchone())[0] or 0
+            
+            # Количество пользователей за последние 24 часа
+            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+            async with db.execute(
+                'SELECT COUNT(*) FROM users WHERE registration_date > ?',
+                (yesterday,)
+            ) as cursor:
+                new_users_24h = (await cursor.fetchone())[0]
+
+        text = (
+            f"📊 Статистика бота:\n\n"
+            f"👤 Всего пользователей: {total_users}\n"
+            f"📈 Новых за 24 часа: {new_users_24h}\n"
+            f"💳 Успешных покупок: {total_purchases}\n"
+            f"💰 Общий доход: {total_revenue:.2f} USDT"
+        )
+        
+        await message.reply_text(text)
+    except Exception as e:
+        logging.error(f"Ошибка при получении статистики: {e}")
+        await message.reply_text("❌ Ошибка при получении статистики")
+
+async def main():
+    try:
+        # Инициализация базы данных
+        await init_db()
+        
+        # Очистка старых платежей
+        await cleanup_old_purchases()
+        
+        # Запуск бота
+        print("✅ Бот успешно запущен!")
+        await bot.start()
+        
+        # Бесконечный цикл для поддержания работы бота
+        await asyncio.Event().wait()
+    except Exception as e:
+        logging.error(f"Критическая ошибка при запуске бота: {e}")
+        print(f"❌ Ошибка при запуске бота: {e}")
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n✅ Бот остановлен")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+    finally:
+        loop.close()
